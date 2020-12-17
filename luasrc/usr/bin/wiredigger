@@ -1,0 +1,622 @@
+#!/usr/bin/lua
+local ubus = require "ubus"
+local nixio = require "nixio"
+local nixutil = require "nixio.util"
+local fs = require('nixio.fs')
+local site = require 'gluon.site_config'
+local uci = require('simple-uci').cursor()
+local json = require("luci.jsonc")
+local wiredigger_version = "1"
+-- interfaces auf mesh_vpn bündeln mit post-up ebtables -A FORWARD --logical-in GREITF -j DROP
+local function dbg(str)
+	print(str)
+	--logger?
+end
+
+local function daemonize()
+	if nixio.getppid() == 1 then return end
+
+	local pid, code, msg = nixio.fork()
+	if not pid then
+		return nil, code, msg
+	elseif pid > 0 then
+		os.exit(0)
+	end
+
+	nixio.setsid()
+	nixio.chdir("/")
+
+	local devnull = nixio.open("/dev/null", nixio.open_flags("rdwr"))
+	nixio.dup(devnull, nixio.stdin)
+	nixio.dup(devnull, nixio.stdout)
+	nixio.dup(devnull, nixio.stderr)
+
+	return true
+end
+
+local function in_table(tbl, val)
+	for i, t in ipairs(tbl) do
+		if t == val then return true end
+	end
+	return false
+end
+
+local function file_exists(filename)
+	return fs.stat(filename, 'type') == 'reg'
+end
+
+local function jsonparse(str) 
+	local parser = json.new()
+	parser:parse(str)
+	return parser:get()
+end
+
+local function urlencode(str)
+	if type(str) == "string" then
+		return str:gsub("([^a-zA-Z0-9$_%-%.%~])", function(chr)
+				return string.format("%%%02x", string.byte(chr))
+			end)
+	end
+end
+
+function get_iface_statistics(iface)
+	local conn = ubus.connect()
+	if not conn then return {} end
+	local status = conn:call("network.device", "status", { name = iface })
+	return status['statistics']
+end
+
+--- Parse certain units from the given string and return the canonical integer
+-- value or 0 if the unit is unknown. Upper- or lower case is irrelevant.
+-- Recognized units are:
+--  o "kb"  - one kilobyte (1024)
+--  o "mb"	- one megabyte (1024*1024)
+--  o "gb"	- one gigabyte (1024*1024*1024)
+--  o "kib" - one si kilobyte (1000)
+--  o "mib"	- one si megabyte (1000*1000)
+--  o "gib"	- one si gigabyte (1000*1000*1000)
+-- @param ustr	String containing a numerical value with trailing unit
+-- @return		Number containing the canonical value
+local function parse_units(ustr)
+
+	local val = 0
+
+	-- unit map
+	local map = {
+		-- storage sizes
+		kb  = 1024,
+		mb  = 1024 * 1024,
+		gb  = 1024 * 1024 * 1024,
+
+		-- storage sizes (si)
+		kib = 1000,
+		mib = 1000 * 1000,
+		gib = 1000 * 1000 * 1000
+	}
+
+	-- parse input string
+	for spec in ustr:lower():gmatch("[0-9%.]+[a-zA-Z]*") do
+
+		local num = spec:gsub("[^0-9%.]+$","")
+		local spn = spec:gsub("^[0-9%.]+", "")
+
+		if map[spn] or map[spn:sub(1,1)] then
+			val = val + num * ( map[spn] or map[spn:sub(1,1)] )
+		else
+			val = val + num
+		end
+	end
+
+
+	return val
+end
+
+
+local function cmd(command)
+	return io.popen(command):read("*all")
+end
+
+local function uptime()
+	return math.floor(tonumber(fs.readfile('/proc/uptime'):match('^([^ ]+) ')))
+end
+
+
+local function genkey()
+	return io.popen('/usr/bin/wg genkey'):read("*l")
+end
+
+local function genpsk()
+	return io.popen('/usr/bin/wg genpsk'):read("*l")
+end
+
+local function genpub(prv)
+	-- is nixio.open or nixio.popen the right choice for piping the secret?
+	return io.popen("echo '" .. prv .. "' | wg pubkey"):read("*l")
+end
+
+local function ping(host, interface) 
+	if os.execute("ping -I '" .. interface .. "' -w 10 -c1 '" .. host .. "' > /dev/null") == 0 then return true end
+	return false
+end
+
+local function batctl_ping(host)
+	local p = {}
+	local h = assert(io.popen('batctl ping -c 3 ' .. host))
+	for l in h:lines() do
+		table.insert(p, l)
+	end
+	p[#p]=nil
+	if not p[#p].find(p[#p], "received, 100") then
+	-- not 100% packet loss
+		return true
+	end
+	
+	return false
+end
+
+
+local function get_batadv_neighbours()
+	local p = io.popen('/lib/gluon/status-page/providers/neighbours-batadv | head -n3 | grep data | tr "\n" " " | cut -c 7-')
+	-- lua sucks?!
+	os.execute('sleep 12')
+	local ret = jsonparse(p:read("*l"))
+	
+	local ifret = {}
+	for mac, data in pairs(ret) do
+		local dat = data
+		if ifret[dat['ifname']] == nil then
+			ifret[dat['ifname']] = {}
+		end
+		dat['ifname'] = nil
+		ifret[ifname][mac] = dat
+	end
+
+	return ifret
+end
+
+local function wg_dump(wgiface)
+--wg show all dump
+end
+
+
+local function wg_down(wgiface, greiface)
+--on-disestablish
+--on-down cmd("batctl if del " .. greiface) cmd("ip link del dev '" .. greiface .."' 2>/dev/null")
+	cmd("ip link set dev " .. greiface .. " down")
+--on post down
+	cmd("ip link del dev '" .. wgiface .. "'")
+end
+
+local function wg_up(wgiface, mtu, secret)
+	cmd("ip link add dev '" .. wgiface .. "' type wireguard")
+	cmd("ip link set mtu '" .. tostring(mtu) .. "' dev " .. wgiface)
+	local secret_file = os.tmpname()
+	io.open(secret_file, 'w'):write()
+	fs.chmod(secret_file, 0700)
+	io.open(secret_file, 'w'):write(secret)
+	cmd("wg set '" .. wgiface .. "' private-key '" .. secret_file .."'")
+	os.remove(secret_file)
+end
+
+local function bat_down(greiface)
+	cmd("batctl if del " .. greiface)
+	cmd("ip link set dev " .. greiface .. " down")
+	cmd("ip link del " .. greiface)
+end
+
+local function bat_up(greiface, ip, remote)
+	cmd("ip link add " .. greiface .. " type gretap local " .. ip .. " remote " .. remote)
+	cmd("ip link set dev " .. greiface .. " up")
+	cmd("batctl if add " .. greiface)
+
+	sleep(40)
+	-- does arping -I greiface -c1 remote work with wireguard?
+	local neigh = get_batadv_neigbours()
+	if neigh[greiface] then
+		for mac, stat in neigh[greiface] do
+			if tonumber(stat['lastseen']) < 20 and batctl_ping(mac) then
+				return true
+			end
+		end
+	
+	end
+	bat_down(greiface)
+
+	return false
+end
+
+
+local function api_request(host, port, params)
+	local api_answer_file = os.tmpname()
+	local request = "wget - O '" .. api_answer_file .. "' 'http://" .. host .. ":" .. str(port) .. "/wireapi/v1?"
+	for p, v in params do
+		request = request .. urlencode(p) .. "=" .. urlencode(v) .. "&"
+	end
+	request = request + "'"
+	cmd(request)
+	if file_exists(api_answer_file) then
+		local data = jsonparse(fs.readfile(api_answer_file):read("*l"))
+		os.remove(api_answer_file)
+		return data
+	else
+		return false
+	end
+end
+
+local function retrieve_secret(host)
+	local data = api_request(host, 11000, {action = 'retrieve'})
+	if data['status'] == "ok" and data['response'] then
+		return data['response']['shared_secret']
+	end
+	return false
+end
+
+local function submit_pubkey(host, pubkey)
+	local data = api_request(host, 11000, {action = 'submit', pubkey = pubkey})
+	if data['status'] == "ok" and data['response'] and data['response']['pubkey'] == pubkey then
+		local prvip = uci:get('wiredigger', peer, 'prvip')
+		return data['response']['ip']
+	end
+	return false
+end
+
+local function get_peers(group, peers)
+	uci:foreach('wiredigger', 'peer', function(p) 
+		if p.enabled and p.group == group['.name'] then 
+			table.insert(peers, p['.name'])
+		end
+	end)
+
+	uci:foreach('wiredigger', 'peer_group', function(g) 
+		if g.enabled and g.parent == group['.name'] then
+			peers = get_peers(g['.name'], peers)
+		end
+	end)
+
+	return peers
+end
+
+
+local function select_peers(group, activepeers, blockedpeers, metalimit)
+	if not group.enabled then return {} end
+	local estabpeers = {}
+	local peers = {}
+	local subgroups = {}
+	local climit = group.peer_limit
+
+	uci:foreach('wiredigger', 'peer_group', function(g) 
+		if g.enabled and g.parent == group['.name'] then
+				table.insert(subgroups, g)
+				local subpeers = get_peers(g, {})
+				for _, peer in pairs(subpeers) do	
+					if in_table(activepeers, subpeers[i]) then
+						climit = climit - 1 
+					end
+				end
+		end
+	end)
+
+	uci:foreach('wiredigger', 'peer', function(p) 
+		if p.enabled and p.group == group['.name'] then 
+			if in_table(activepeers, p['.name']) then
+				climit = climit - 1
+			elseif not in_table(blockedpeers, p['.name']) then
+				table.insert(peers, p['.name'])
+			end
+		end
+	end)
+
+	if metalimit and climit > metalimit then climit = metalimit end
+	while climit > 0 and (#peers or #subgroups) do
+		local dopeers = 1.0/(#subgroups + #peers) * #subgroups
+		if math.random() > dopeers then
+			local peerid = math.random(#peers)
+			table.insert(estabpeers, peers[peerid])
+			table.insert(activepeers, peers[peerid])
+			table.remove(peers, peerid)
+			climit = climit - 1
+		else
+			local groupid = math.random(#subgroups)
+			local estb = select_peers(subgroup[groupid], activepeers, 1)
+			if #estb then
+				table.insert(activepeers, estb[1]) 
+				table.insert(estabpeers, estb[1])
+				climit = climit - 1
+			else
+				table.remove(subgroups, groupid)
+			end
+		end
+	end
+
+	return estabpeers
+end
+
+
+
+
+
+local function init_peer(wgiface, psk, ip, pubkey, endpoint, allowedips, keepalive, remote)
+	local pskcmd = ""
+	if psk then
+		local psk_file = os.tmpname()
+		io.open(psk_file, 'w'):write()
+		fs.chmod(psk_file, 0700)
+		io.open(psk_file, 'w'):write(psk)
+		pskcmd=" preshared-key '" .. psk_file .. "'"
+	end
+	cmd("wg set '" .. wgiface 
+		.. "' peer '" .. pubkey .. "'"
+		.. pskcmd 
+		.. " allowed-ips '" .. table.concat(allowedips, " ")
+		.. "' endpoint '" .. endpoint
+		.. "' persistent-keepalive '" .. tostring(keepalive) .. "'")
+
+	
+	if psk then os.remove(psk_file)	end
+
+	for i = 1, 3 do
+		if ping(remote, wgiface) then
+			return uptime()
+		end
+	end
+	
+
+	cmd("wg set '" .. wgiface 
+	.. "' peer '" .. pubkey .. "'"
+	.. " remove")
+
+	return 0
+end
+
+local function request_ip(wgiface, g)
+	init_wg(wgiface, g.mtu, g.regkey)
+	local regpeers = get_peers(g, {})
+	local newip = false
+	
+	while #regpeers do
+		local peerid = math.random(#regpeers)
+		local peer = uci:get_all("wiredigger", regpeers[peerid])
+		table.remove(regpeers, peerid)
+		if init_peer(wgiface, g.psk, g.regip, peer.public_key, peer.endpoint, peer.allowed_ips, g.keepalive) then
+			newip = submit_pubkey(peer.ip, genpub(uci:get('wiredigger', 'mesh_vpn', 'secret')))
+			if newip then
+				ownip = newip
+				uci:set('wiredigger', g['.name'], 'prvip', newip)
+				uci:save('wiredigger')
+				break
+			end
+		end
+	end
+	destroy_wg(wgiface)
+	
+	return newip
+end
+
+
+local function init_mastergroup(wgiface, g, activepeers, blockedpeers)
+	local groupstate = {wgiface = wgiface, peers = {}}
+	local ownip
+	if g.prvip ~= "request" then
+		ownip = g.prvip
+	else
+		if not request_ip(wgiface, g) then
+			return false
+		end
+	end
+	
+	local peernames = select_peers(g, activepeers, blockedpeers, nil)
+	if not #peernames then
+		return false
+	end
+	
+	if not #activepeers and not #blockedpeers then
+		init_wg(wgiface, g.mtu, uci:get('wiredigger', 'mesh_vpn', 'secret'))
+		cmd("ip address add '" .. ownip .. "/" .. tostring(g.cidr) .. "' dev " .. wgiface)
+		--on-pre-up
+		cmd("ip link set up dev " .. wgiface)
+	end
+
+	
+	local pskkey = g.psk
+	--on-connect
+	for _, peername in pairs(peernames) do
+		local peer = uci:get_all("wiredigger", peername)
+		local lastseen = init_peer(wgiface, g.psk, g.ip, peer.public_key, peer.endpoint, peer.allowed_ips, g.keepalive)
+		groupstate['peers'][peer['.name']] = {lastseen = lastseen, lastattempt = uptime(), attempts = 1}
+		if not pskkey and lastseen then
+			pskkey = retrieve_secret(peer.allowed_ips[0])
+			if pskkey then
+				uci:set('wiredigger', g['.name'], 'psk', pskkey)
+				uci:save('wiredigger')
+				destroy_wg(wgiface)
+				-- wait for watchdog to reattempt connection establishment with psk this time
+				return {wgiface = wgiface, peers = {}}
+			end
+		end
+	end
+	return groupstate
+end
+
+local function init_wiredigger()
+	-- kill old?
+	local wgprefix = "wgtun"
+	local iface_counter = 0
+	local state = {}
+	local mastergroups = {}
+
+	uci:foreach('wiredigger', 'peer_group', function(g) 
+		if g.enabled and not g.parent then
+			table.insert(mastergroups, g)
+		end
+	end)
+
+	for _, group in pairs(mastergroups) do
+		local wgiface = wgprefix .. tostring(iface_counter)
+		local ret = init_mastergroup(wgiface, group, {}, {})
+		if ret then
+			state[group['.name']] = ret
+			iface_counter = iface_counter + 1
+		end
+	end
+
+	return state
+end
+
+
+
+--aims to mimic fastd's status output
+local function jsonstatus(state)
+	local ret = {}
+	ret['peers'] = {}
+	uci:foreach('wiredigger', 'peer', function(p) 
+		if p.enabled then 
+			ret['peers'][p.pubkey] = {name = p['.name'], address = 'any'}
+		end
+	end)
+	for groupname, dat in state['groups'] do
+		local stat = get_iface_statistics(dat['wgiface'])
+		local statistics = {tx = {packets = stat['tx_packets'], bytes = stat['tx_bytes']}, 
+					rx = {packets = stat['rx_packets'], bytes = stat['rx_bytes']}, 
+					tx_error = {packets = stat['tx_error']}, 
+					tx_dropped= {packets = stat["tx_dropped"]},
+					rx_reordered= {packets = stat["rx_reordered"]},
+					}
+		for peername, conn in dat['peers'] do
+			if conn['lastseen'] > 0 then
+								
+				local connection = {established = (uptime()-conn['established']) * 1000, statistics = statistics}
+				peer['connection'] = connection
+			end
+		end
+	end
+
+	return ret
+end
+
+
+-- Set user group
+nixio.setgid(nixio.getgr(uci:get('wiredigger', 'group')))
+
+local skip = false
+local socket_path = ""
+local pid_path =""
+local actions = {}
+local oncoms = {}
+
+for i=1, #arg do
+	if skip then 
+		skip = false
+	elseif arg[i] == "--generate-key" then
+		table.insert(actions, "genkey")
+	elseif arg[i] == "--show-key" then
+		table.insert(actions, "pubkey")
+	elseif arg[i] == "--status-socket" then
+		table.insert(actions, "socket")
+		socket_path = arg[i+1]
+		skip = true
+	elseif arg[i] == "--pid-file" then
+		table.insert(actions, "pid")
+		pid_path = arg[i+1]
+		skip = true
+	elseif arg[i] == "--version" or arg[i] == "--v" then
+		table.insert(actions , "version")
+	elseif arg[i] == "--daemon" or arg[i] == "-d" then
+		table.insert(actions , "daemon")
+	elseif arg[i] == "--help" or arg[i] == "-h" then
+		table.insert(actions , "help")
+	elseif arg[i]:sub(1,5) == "--on-" then
+		table.insert(actions , arg[i]:sub(6))
+		oncoms[arg[i]:sub(6)] = arg[i+1]
+	end
+end
+
+if #actions == 0 or in_table(actions, "help") then
+	quit('--help, -h	Shows this help text \
+--version, -v	Shows the `wireguard/digger` version \
+--daemon, -d	Runs wiredigger in the background \
+--pid-file <filename> \
+ 	Writes wiredigger’s PID to specified file. \
+--status-socket <socket> \
+ 	Configures a socket to get wiredigger’s status.')
+
+elseif in_table(actions, "version") then
+	local wireguard_version = io.popen('logread | grep -o \'WireGuard[^a]\{1,32\}loaded\' | cut -d" " -f2'):read("*l") or "unknown"
+	quit(wireguard_version .. "/" .. wiredigger_version)
+
+elseif in_table(actions, "genkey") then
+	if in_table(actions, "machinereadble") then
+		quit(genkey())
+	else
+		quit("This is a PRIVATE key (don't share it!): " .. genkey())
+	end
+
+elseif in_table(actions, "pubkey") then
+	local pk = uci:get('wiredigger', 'mesh_vpn', 'secret')
+	if not pk or pk == "generate" then pk = "" end
+	pk = genpub(pk)
+	if in_table(actions, "machinereadble") then
+		quit(pk)
+	else
+		quit("This is your public key: " .. pk)
+	end
+end
+
+if in_table(actions, "daemon") then
+	local stat, code, msg = daemonize()
+	if not stat then
+		nixio.syslog("crit", "Unable to daemonize process: " .. msg .. "\n")
+		os.exit(2)
+	end
+end
+
+if in_table(actions, "socket") and nixio.fork() == 0 then
+	statsock = nixio.bind(socket_path)
+	statsock:listen(32)
+
+	while true do		
+		client = statsock:accept()
+		if nixio.fork() == 0 then
+			break
+		end
+		client:close()
+		nixio.wait(nil, "nohang")
+	end
+	client:write(jsonstatus(wiredigger_status()))
+	client:close()
+	os.exit(0)
+end
+
+if in_table(actions, "pid") then
+	io.open(pid_file, 'w'):write(tostring(nixio.getpid()))
+end
+
+math.randomseed(os.time())
+
+local state = init_wiredigger()
+
+-- WATCHDOG
+while true do
+	sleep(60)
+	for group, dat in pairs(state) do
+		local g = uci:get_all("wiredigger", group)
+		local timeout = uptime() - 300
+		local brokenpeers = {}
+		local activepeers = {}
+		for peername, p in pairs(dat['peers']) do
+			if p['lastseen'] < timeout then
+				table.insert(brokenpeers, peername)
+			else
+				table.insert(activepeers, peername)
+			end
+		end
+		local gstate = init_mastergroup(wgiface, g, activepeers, brokenpeers)
+		if gstate ~= false then
+			for k, v in pairs(gstate['peers']) do
+				state[group]['peers'][k] = v
+			end
+		end
+	end
+end
+
+
+
