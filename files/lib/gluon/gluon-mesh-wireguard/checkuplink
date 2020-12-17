@@ -1,0 +1,22 @@
+#!/bin/sh
+# check uplink
+
+gredown() {
+ifconfig gre6 |grep UP && ifconfig gre6 down
+ifconfig wg0 |grep UP && ifconfig wg0 down
+# we dont care about inactive batif
+exit 0
+}
+
+# check br-wan route
+# only v4 - v6 only may be diff.?!
+ip r show dev br-wan |grep -q default || gredown()
+
+# if freifunk network (all other 10.0.0.0/8 fail)
+ip r show dev br-wan |grep -q "src 10.60." && gredown()
+
+# poor mans www check (2 diff. ip)
+ping 8.8.4.4 -c2 -w3 -I br-wan || ping 178.254.39.111 -c2 -w3 -I br-wan || gredown()
+
+# greup or load wg script at all
+ifconfig wg0 up && ifconfig gre6 up || /lib/gluon/gluon-mesh-wireguard/gluon-mesh-wireguard

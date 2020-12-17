@@ -1,0 +1,33 @@
+#!/bin/sh
+serverwgv6=$(uci get wireguard.mesh1.gretapip)
+ownip=$(uci get wireguard.wireguard.ownip)
+
+# check if key exist
+[ -f /root/wg_privatekey ] || wg genkey > /root/wg_privatekey && wg pubkey < /root/wg_privatekey > /tmp/wg_publickey
+# del and make new wg0
+ip link del dev wg0 2>/dev/null || true
+ip link add dev wg0 type wireguard
+
+wg set \
+	$(uci get wireguard.wireguard.iface) \
+	listen-port $(uci get wireguard.wireguard.port) \
+	private-key /root/wg_privatekey \
+        peer $(uci get wireguard.mesh1.PublicKey) \
+	endpoint $(uci get wireguard.mesh1.Endpoint) \
+	persistent-keepalive 30 \
+        allowed-ips $(uci get wireguard.mesh1.AllowedIps) \
+
+# addconf
+ip addr add $ownip/64 dev wg0
+ip address add $ownip/128 peer $serverwgv6/128 dev wg0
+ip link set up dev wg0
+
+# grestuff
+ip link add gre6 type ip6gretap local $ownip remote $serverwgv6 dev wg0
+ifconfig gre6 up
+
+# batman
+batctl if add gre6
+# echo $IP
+echo $ownip
+wg pubkey < /root/wg_privatekey
